@@ -1,0 +1,67 @@
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/ascii-trace-helper.h"
+
+using namespace ns3;
+
+int main() {
+    // Enable basic logging
+    LogComponentEnable("UdpEchoClientApplication", LOG_LEVEL_INFO);
+    LogComponentEnable("UdpEchoServerApplication", LOG_LEVEL_INFO);
+
+    // 1. Create nodes
+    NodeContainer cloud, mec;
+    cloud.Create(1);
+    mec.Create(1);
+
+    // 2. Network setup
+    PointToPointHelper p2p;
+    p2p.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+    p2p.SetChannelAttribute("Delay", StringValue("2ms"));
+    NetDeviceContainer devices = p2p.Install(cloud.Get(0), mec.Get(0));
+
+    // 3. Internet stack
+    InternetStackHelper stack;
+    stack.Install(cloud);
+    stack.Install(mec);
+
+    // 4. IP addressing
+    Ipv4AddressHelper address;
+    address.SetBase("10.1.1.0", "255.255.255.0");
+    Ipv4InterfaceContainer interfaces = address.Assign(devices);
+
+    // 5. Traffic generation
+    UdpEchoServerHelper server(9);
+    ApplicationContainer serverApps = server.Install(cloud.Get(0));
+    serverApps.Start(Seconds(1.0));
+    serverApps.Stop(Seconds(10.0));
+
+    UdpEchoClientHelper client(interfaces.GetAddress(0), 9);
+    client.SetAttribute("MaxPackets", UintegerValue(3));
+    client.SetAttribute("Interval", TimeValue(Seconds(1.0)));
+    client.SetAttribute("PacketSize", UintegerValue(1024));
+    ApplicationContainer clientApps = client.Install(mec.Get(0));
+    clientApps.Start(Seconds(2.0));
+    clientApps.Stop(Seconds(5.0));
+
+    // 6. Enable tracing
+    AsciiTraceHelper ascii;
+    p2p.EnableAsciiAll(ascii.CreateFileStream("mec-fog.tr"));
+
+    // 7. Run simulation
+    Simulator::Stop(Seconds(10.0));
+    Simulator::Run();
+    Simulator::Destroy();
+
+    std::cout << "Phase 1 completed successfully!" << std::endl;
+    
+    // Print IP assignments
+    std::cout << "\nIP Addresses:" << std::endl;
+    std::cout << "Cloud: " << interfaces.GetAddress(0) << std::endl;
+    std::cout << "MEC: " << interfaces.GetAddress(1) << std::endl;
+    
+    return 0;
+}
