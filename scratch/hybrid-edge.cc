@@ -16,6 +16,7 @@
 #include <list>
 #include <cstring>
 #include <vector>
+#include <fstream> // Added for event logging
 
 using namespace ns3;
 
@@ -30,10 +31,19 @@ uint32_t fogCap     = 5;   // max concurrent tasks Fog
 uint32_t cacheSize  = 10;  // LRU entries per node
 uint32_t packetSize = 1400; // Large packet size for heavy data
 std::string dataRate = "10Mbps"; // Large data rate for heavy data
+// Add new global parameters for IoT realism
+uint32_t mecMips = 20000; // MEC node capacity in MIPS
+uint32_t fogMips = 5000;  // Fog node capacity in MIPS
+uint32_t minTaskMi = 5000; // Minimum task size in MI
+uint32_t maxTaskMi = 20000; // Maximum task size in MI
+uint32_t numFiles = 100;    // Number of unique files in the system
 // -------------------------
 
 // Global counters
 uint64_t g_cacheHits = 0, g_totalReq = 0, g_peerHits = 0;
+
+// Add a log file for event logging
+std::ofstream g_eventLog("hybrid-edge-event-log.txt");
 
 // ---------- LRU cache ----------
 template<typename K, typename V>
@@ -83,6 +93,9 @@ public:
   void SetComputeDelayBase (Time base);
   void SetComputeDelayPerByte (Time perByte);
   void ReceivePeerQuery(Ptr<Socket> socket);
+  void InsertToCache(const std::string& content) {
+    m_cache->Insert(content, true);
+  }
 
 private:
   virtual void StartApplication (void);
@@ -142,6 +155,13 @@ void HybridCompute::HandleRead(Ptr<Socket> socket)
   std::string content (reinterpret_cast<char*> (buf), len);
   g_totalReq++;
 
+  // Simulate a real task size (random between minTaskMi and maxTaskMi)
+  Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
+  uint32_t taskMi = uv->GetInteger(minTaskMi, maxTaskMi);
+  uint32_t nodeMips = (m_type == "MEC") ? mecMips : fogMips;
+  double computeTimeSec = double(taskMi) / nodeMips;
+  Time dynamicDelay = Seconds(computeTimeSec);
+
   // Peer cache query response (special prefix)
   if (content.rfind("PEERHIT:", 0) == 0) {
     std::string origContent = content.substr(8);
@@ -174,9 +194,14 @@ void HybridCompute::HandleRead(Ptr<Socket> socket)
   }
 
   // Local cache check
-  if (m_cache->Contains (content))
+  bool cacheHit = m_cache->Contains (content);
+  if (cacheHit)
     {
       g_cacheHits++;
+      // Log event
+      g_eventLog << "[REQ] " << Simulator::Now().GetSeconds() << " "
+                 << GetNode()->GetId() << " " << content << " MEC/Fog " << m_type
+                 << " CACHE_HIT 0 " << computeTimeSec << std::endl;
       SendResponse (content, from);
       return;
     }
@@ -193,17 +218,27 @@ void HybridCompute::HandleRead(Ptr<Socket> socket)
         peerSock->Send(Create<Packet>((uint8_t*)peerQuery.c_str(), peerQuery.size()));
         peerSock->Close();
       }
+      // Log event (cache miss, peer query)
+      g_eventLog << "[REQ] " << Simulator::Now().GetSeconds() << " "
+                 << GetNode()->GetId() << " " << content << " Fog CACHE_MISS_PEER 0 " << computeTimeSec << std::endl;
       return;
     }
   // If overloaded, forward upward
   if (m_current >= m_capacity)
     {
+      // Log event (offload)
+      g_eventLog << "[REQ] " << Simulator::Now().GetSeconds() << " "
+                 << GetNode()->GetId() << " " << content << " " << m_type
+                 << " OFFLOAD 1 " << computeTimeSec << std::endl;
       ForwardUpward(content, from, buf, len);
       return;
     }
   // Process locally (compute delay proportional to data size)
   m_current++;
-  Time dynamicDelay = m_computeDelayBase + m_computeDelayPerByte * len;
+  // Log event (cache miss, local compute)
+  g_eventLog << "[REQ] " << Simulator::Now().GetSeconds() << " "
+             << GetNode()->GetId() << " " << content << " " << m_type
+             << " CACHE_MISS_LOCAL 0 " << computeTimeSec << std::endl;
   Simulator::Schedule (dynamicDelay, &HybridCompute::ComputeAndStore, this, content, from);
 }
 
@@ -249,6 +284,25 @@ void HybridCompute::ReceivePeerQuery(Ptr<Socket> socket) {
     respSock->Connect(from);
     respSock->Send(Create<Packet>((uint8_t*)resp.c_str(), resp.size()));
     respSock->Close();
+  }
+}
+
+// Prepopulate MEC and Fog caches with random files
+void PrepopulateCaches(const std::vector<Ptr<HybridCompute>>& mecApps, const std::vector<Ptr<HybridCompute>>& fogApps, uint32_t numFiles) {
+  Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
+  for (auto app : mecApps) {
+    for (uint32_t i = 0; i < numFiles/2; ++i) { // 50% files cached
+      std::string file = "file" + std::to_string(uv->GetInteger(0, numFiles-1));
+      app->InsertToCache(file);
+      g_eventLog << "[CACHE_POP] MEC " << app->GetNode()->GetId() << " " << file << std::endl;
+    }
+  }
+  for (auto app : fogApps) {
+    for (uint32_t i = 0; i < numFiles/2; ++i) {
+      std::string file = "file" + std::to_string(uv->GetInteger(0, numFiles-1));
+      app->InsertToCache(file);
+      g_eventLog << "[CACHE_POP] FOG " << app->GetNode()->GetId() << " " << file << std::endl;
+    }
   }
 }
 
@@ -301,6 +355,7 @@ void CreateTopology ()
       fog.Get(f)->GetObject<Ipv4>()->GetAddress(1,0).GetLocal(), 50000));
 
   // Install Fog applications with peer addresses
+  std::vector<Ptr<HybridCompute>> fogApps;
   for (uint32_t f = 0; f < fog.GetN (); ++f)
     {
       std::vector<Address> peers;
@@ -311,6 +366,7 @@ void CreateTopology ()
       fogApp->SetComputeDelayBase (MilliSeconds (10));
       fogApp->SetComputeDelayPerByte (MicroSeconds (10));
       fog.Get (f)->AddApplication (fogApp);
+      fogApps.push_back(fogApp);
       // Install peer query socket
       Ptr<Socket> peerSock = Socket::CreateSocket(fog.Get(f), UdpSocketFactory::GetTypeId());
       peerSock->Bind(InetSocketAddress(Ipv4Address::GetAny(), 50000));
@@ -318,6 +374,7 @@ void CreateTopology ()
     }
 
   // Install MEC applications
+  std::vector<Ptr<HybridCompute>> mecApps;
   for (uint32_t m = 0; m < mec.GetN (); ++m)
     {
       Address fogAddr = InetSocketAddress (
@@ -328,7 +385,10 @@ void CreateTopology ()
       mecApp->SetComputeDelayBase (MilliSeconds (5));
       mecApp->SetComputeDelayPerByte (MicroSeconds (5));
       mec.Get (m)->AddApplication (mecApp);
+      mecApps.push_back(mecApp);
     }
+  // Prepopulate caches
+  PrepopulateCaches(mecApps, fogApps, numFiles);
 
   /* ---------- UE clients ---------- */
   OnOffHelper client ("ns3::UdpSocketFactory", Address ());
@@ -337,6 +397,7 @@ void CreateTopology ()
   client.SetAttribute ("DataRate", DataRateValue (DataRate (dataRate)));
   client.SetAttribute ("PacketSize", UintegerValue (packetSize));
 
+  Ptr<UniformRandomVariable> fileUv = CreateObject<UniformRandomVariable>();
   for (uint32_t u = 0; u < ue.GetN (); ++u)
     {
       Ptr<Node> ueNode = ue.Get (u);
@@ -352,7 +413,16 @@ void CreateTopology ()
             mec.Get (mecId)->GetObject<Ipv4> ()->GetAddress (1, 0).GetLocal (), 50000); break;
         }
       client.SetAttribute ("Remote", AddressValue (dest));
-      client.Install (ueNode).Start (Seconds (1.0 + u * reqIntv));
+      ApplicationContainer apps = client.Install (ueNode);
+      apps.Start (Seconds (1.0 + u * reqIntv));
+      // Set the payload for the OnOffApplication
+      Ptr<Application> app = apps.Get(0);
+      Ptr<OnOffApplication> onoff = DynamicCast<OnOffApplication>(app);
+      if (onoff) {
+        std::string file = "file" + std::to_string(fileUv->GetInteger(0, numFiles-1));
+        Ptr<Packet> pkt = Create<Packet>((uint8_t*)file.c_str(), file.size());
+        onoff->SetFill(pkt);
+      }
     }
 }
 
@@ -365,6 +435,11 @@ main (int argc, char *argv[])
   cmd.AddValue ("cacheSize", "Cache entries per node", cacheSize);
   cmd.AddValue ("packetSize", "Packet size (bytes)", packetSize);
   cmd.AddValue ("dataRate", "Data rate for UEs", dataRate);
+  cmd.AddValue ("mecMips", "MEC node capacity in MIPS", mecMips);
+  cmd.AddValue ("fogMips", "Fog node capacity in MIPS", fogMips);
+  cmd.AddValue ("minTaskMi", "Minimum task size in MI", minTaskMi);
+  cmd.AddValue ("maxTaskMi", "Maximum task size in MI", maxTaskMi);
+  cmd.AddValue ("numFiles", "Number of unique files", numFiles);
   cmd.Parse (argc, argv);
 
   CreateTopology ();
@@ -399,5 +474,6 @@ main (int argc, char *argv[])
   std::cout << "Cache hit (peer %):    " << peerHitRatio << "\n";
 
   Simulator::Destroy ();
+  g_eventLog.close();
   return 0;
 }
