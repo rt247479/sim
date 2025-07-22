@@ -79,27 +79,21 @@ public:
   HybridCompute () : m_socket (nullptr), m_capacity (0), m_current (0) {}
   void Setup (Address upstream, std::string type,
               uint32_t capacity, uint32_t cacheSz,
-              std::vector<Address> peerFogs = {})
-  {
-    m_upstream  = upstream;
-    m_type      = type;
-    m_capacity  = capacity;
-    m_cache     = std::make_unique<LRUCache<std::string, bool>> (cacheSz);
-    m_peerFogs  = peerFogs;
-  }
-  void SetComputeDelayBase (Time base) { m_computeDelayBase = base; }
-  void SetComputeDelayPerByte (Time perByte) { m_computeDelayPerByte = perByte; }
+              std::vector<Address> peerFogs = {});
+  void SetComputeDelayBase (Time base);
+  void SetComputeDelayPerByte (Time perByte);
+  void ReceivePeerQuery(Ptr<Socket> socket);
 
 private:
-  virtual void StartApplication (void)
-  {
-    m_socket = Socket::CreateSocket (GetNode (), UdpSocketFactory::GetTypeId ());
-    m_socket->Bind (InetSocketAddress (Ipv4Address::GetAny (), 50000));
-    m_socket->SetRecvCallback (MakeCallback (&HybridCompute::HandleRead, this));
-  }
-  virtual void StopApplication (void) { if (m_socket) m_socket->Close (); }
+  virtual void StartApplication (void);
+  virtual void StopApplication (void);
+  virtual void DoDispose() override;
 
-  // For peer Fog cache query
+  void HandleRead (Ptr<Socket> socket);
+  void ForwardUpward(const std::string& content, Address from, uint8_t* buf, uint32_t len);
+  void ComputeAndStore (std::string content, Address to);
+  void SendResponse (std::string content, Address dest);
+
   struct PendingRequest {
     std::string content;
     Address from;
@@ -107,127 +101,6 @@ private:
     bool peerHit;
   };
   std::unordered_map<std::string, PendingRequest> m_pendingPeerReqs;
-
-  void HandleRead (Ptr<Socket> socket)
-  {
-    Address from;
-    Ptr<Packet> pkt = socket->RecvFrom (from);
-    uint8_t buf[2048];
-    uint32_t len = pkt->CopyData (buf, sizeof (buf));
-    std::string content (reinterpret_cast<char*> (buf), len);
-    g_totalReq++;
-
-    // Peer cache query response (special prefix)
-    if (content.rfind("PEERHIT:", 0) == 0) {
-      std::string origContent = content.substr(8);
-      auto it = m_pendingPeerReqs.find(origContent);
-      if (it != m_pendingPeerReqs.end()) {
-        it->second.peerHit = true;
-        it->second.pendingPeers--;
-        if (it->second.pendingPeers == 0) {
-          // Serve from peer
-          g_peerHits++;
-          SendResponse(origContent, it->second.from);
-          m_cache->Insert(origContent, true);
-          m_pendingPeerReqs.erase(it);
-        }
-      }
-      return;
-    }
-    if (content.rfind("PEERMISS:", 0) == 0) {
-      std::string origContent = content.substr(9);
-      auto it = m_pendingPeerReqs.find(origContent);
-      if (it != m_pendingPeerReqs.end()) {
-        it->second.pendingPeers--;
-        if (it->second.pendingPeers == 0 && !it->second.peerHit) {
-          // No peer had it, forward upward
-          ForwardUpward(origContent, it->second.from, buf, len);
-          m_pendingPeerReqs.erase(it);
-        }
-      }
-      return;
-    }
-
-    // Local cache check
-    if (m_cache->Contains (content))
-      {
-        g_cacheHits++;
-        SendResponse (content, from);
-        return;
-      }
-    // If Fog, try peer Fogs before going up
-    if (m_type == "Fog" && !m_peerFogs.empty())
-      {
-        // Send peer query to all peers
-        PendingRequest req{content, from, (uint32_t)m_peerFogs.size(), false};
-        m_pendingPeerReqs[content] = req;
-        for (const auto& peer : m_peerFogs) {
-          Ptr<Socket> peerSock = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-          std::string peerQuery = "PEERQRY:" + content;
-          peerSock->Connect(peer);
-          peerSock->Send(Create<Packet>((uint8_t*)peerQuery.c_str(), peerQuery.size()));
-          peerSock->Close();
-        }
-        return;
-      }
-    // If overloaded, forward upward
-    if (m_current >= m_capacity)
-      {
-        ForwardUpward(content, from, buf, len);
-        return;
-      }
-    // Process locally (compute delay proportional to data size)
-    m_current++;
-    Time dynamicDelay = m_computeDelayBase + m_computeDelayPerByte * len;
-    Simulator::Schedule (dynamicDelay, &HybridCompute::ComputeAndStore, this, content, from);
-  }
-
-  void ForwardUpward(const std::string& content, Address from, uint8_t* buf, uint32_t len) {
-    Ptr<Socket> up = Socket::CreateSocket (GetNode (), UdpSocketFactory::GetTypeId ());
-    up->Connect (m_upstream);
-    // Attach original sender address as prefix if needed for response routing
-    up->Send (Create<Packet> (buf, len));
-    up->Close();
-  }
-
-  void ComputeAndStore (std::string content, Address to)
-  {
-    SendResponse (content, to);
-    m_cache->Insert (content, true);
-    m_current--;
-  }
-
-  void SendResponse (std::string content, Address dest)
-  {
-    Ptr<Packet> pkt = Create<Packet> (reinterpret_cast<const uint8_t*> (content.c_str ()), content.size ());
-    m_socket->SendTo (pkt, 0, dest);
-  }
-
-  // For peer Fog: handle peer queries
-  virtual void DoDispose() override {
-    m_pendingPeerReqs.clear();
-    Application::DoDispose();
-  }
-
-  virtual void ReceivePeerQuery(Ptr<Socket> socket) {
-    Address from;
-    Ptr<Packet> pkt = socket->RecvFrom(from);
-    uint8_t buf[2048];
-    uint32_t len = pkt->CopyData(buf, sizeof(buf));
-    std::string content(reinterpret_cast<char*>(buf), len);
-    if (content.rfind("PEERQRY:", 0) == 0) {
-      std::string origContent = content.substr(8);
-      std::string resp;
-      if (m_cache->Contains(origContent))
-        resp = "PEERHIT:" + origContent;
-      else
-        resp = "PEERMISS:" + origContent;
-      Ptr<Socket> respSock = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-      respSock->Connect(from);
-      respSock->Send(Create<Packet>((uint8_t*)resp.c_str(), resp.size()));
-      respSock->Close();
-    }
-  }
 
   Ptr<Socket> m_socket;
   Address m_upstream;
@@ -238,6 +111,146 @@ private:
   std::unique_ptr<LRUCache<std::string, bool>> m_cache;
   std::vector<Address> m_peerFogs;
 };
+
+void HybridCompute::Setup(Address upstream, std::string type,
+              uint32_t capacity, uint32_t cacheSz,
+              std::vector<Address> peerFogs)
+{
+  m_upstream  = upstream;
+  m_type      = type;
+  m_capacity  = capacity;
+  m_cache     = std::make_unique<LRUCache<std::string, bool>> (cacheSz);
+  m_peerFogs  = peerFogs;
+}
+void HybridCompute::SetComputeDelayBase(Time base) { m_computeDelayBase = base; }
+void HybridCompute::SetComputeDelayPerByte(Time perByte) { m_computeDelayPerByte = perByte; }
+
+void HybridCompute::StartApplication(void)
+{
+  m_socket = Socket::CreateSocket (GetNode (), UdpSocketFactory::GetTypeId ());
+  m_socket->Bind (InetSocketAddress (Ipv4Address::GetAny (), 50000));
+  m_socket->SetRecvCallback (MakeCallback (&HybridCompute::HandleRead, this));
+}
+void HybridCompute::StopApplication(void) { if (m_socket) m_socket->Close (); }
+
+void HybridCompute::HandleRead(Ptr<Socket> socket)
+{
+  Address from;
+  Ptr<Packet> pkt = socket->RecvFrom (from);
+  uint8_t buf[2048];
+  uint32_t len = pkt->CopyData (buf, sizeof (buf));
+  std::string content (reinterpret_cast<char*> (buf), len);
+  g_totalReq++;
+
+  // Peer cache query response (special prefix)
+  if (content.rfind("PEERHIT:", 0) == 0) {
+    std::string origContent = content.substr(8);
+    auto it = m_pendingPeerReqs.find(origContent);
+    if (it != m_pendingPeerReqs.end()) {
+      it->second.peerHit = true;
+      it->second.pendingPeers--;
+      if (it->second.pendingPeers == 0) {
+        // Serve from peer
+        g_peerHits++;
+        SendResponse(origContent, it->second.from);
+        m_cache->Insert(origContent, true);
+        m_pendingPeerReqs.erase(it);
+      }
+    }
+    return;
+  }
+  if (content.rfind("PEERMISS:", 0) == 0) {
+    std::string origContent = content.substr(9);
+    auto it = m_pendingPeerReqs.find(origContent);
+    if (it != m_pendingPeerReqs.end()) {
+      it->second.pendingPeers--;
+      if (it->second.pendingPeers == 0 && !it->second.peerHit) {
+        // No peer had it, forward upward
+        ForwardUpward(origContent, it->second.from, buf, len);
+        m_pendingPeerReqs.erase(it);
+      }
+    }
+    return;
+  }
+
+  // Local cache check
+  if (m_cache->Contains (content))
+    {
+      g_cacheHits++;
+      SendResponse (content, from);
+      return;
+    }
+  // If Fog, try peer Fogs before going up
+  if (m_type == "Fog" && !m_peerFogs.empty())
+    {
+      // Send peer query to all peers
+      PendingRequest req{content, from, (uint32_t)m_peerFogs.size(), false};
+      m_pendingPeerReqs[content] = req;
+      for (const auto& peer : m_peerFogs) {
+        Ptr<Socket> peerSock = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        std::string peerQuery = "PEERQRY:" + content;
+        peerSock->Connect(peer);
+        peerSock->Send(Create<Packet>((uint8_t*)peerQuery.c_str(), peerQuery.size()));
+        peerSock->Close();
+      }
+      return;
+    }
+  // If overloaded, forward upward
+  if (m_current >= m_capacity)
+    {
+      ForwardUpward(content, from, buf, len);
+      return;
+    }
+  // Process locally (compute delay proportional to data size)
+  m_current++;
+  Time dynamicDelay = m_computeDelayBase + m_computeDelayPerByte * len;
+  Simulator::Schedule (dynamicDelay, &HybridCompute::ComputeAndStore, this, content, from);
+}
+
+void HybridCompute::ForwardUpward(const std::string& content, Address from, uint8_t* buf, uint32_t len) {
+  Ptr<Socket> up = Socket::CreateSocket (GetNode (), UdpSocketFactory::GetTypeId ());
+  up->Connect (m_upstream);
+  up->Send (Create<Packet> (buf, len));
+  up->Close();
+}
+
+void HybridCompute::ComputeAndStore (std::string content, Address to)
+{
+  SendResponse (content, to);
+  m_cache->Insert (content, true);
+  m_current--;
+}
+
+void HybridCompute::SendResponse (std::string content, Address dest)
+{
+  Ptr<Packet> pkt = Create<Packet> (reinterpret_cast<const uint8_t*> (content.c_str ()), content.size ());
+  m_socket->SendTo (pkt, 0, dest);
+}
+
+void HybridCompute::DoDispose() {
+  m_pendingPeerReqs.clear();
+  Application::DoDispose();
+}
+
+void HybridCompute::ReceivePeerQuery(Ptr<Socket> socket) {
+  Address from;
+  Ptr<Packet> pkt = socket->RecvFrom(from);
+  uint8_t buf[2048];
+  uint32_t len = pkt->CopyData(buf, sizeof(buf));
+  std::string content(reinterpret_cast<char*>(buf), len);
+  if (content.rfind("PEERQRY:", 0) == 0) {
+    std::string origContent = content.substr(8);
+    std::string resp;
+    if (m_cache->Contains(origContent))
+      resp = "PEERHIT:" + origContent;
+    else
+      resp = "PEERMISS:" + origContent;
+    Ptr<Socket> respSock = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+    respSock->Connect(from);
+    respSock->Send(Create<Packet>((uint8_t*)resp.c_str(), resp.size()));
+    respSock->Close();
+  }
+}
 
 // ---------- Topology ----------
 void CreateTopology ()
