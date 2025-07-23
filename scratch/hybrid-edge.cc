@@ -17,6 +17,7 @@
 #include <cstring>
 #include <vector>
 #include <fstream> // Added for event logging
+#include <cmath>
 
 using namespace ns3;
 
@@ -37,6 +38,9 @@ uint32_t fogMips = 5000;  // Fog node capacity in MIPS
 uint32_t minTaskMi = 5000; // Minimum task size in MI
 uint32_t maxTaskMi = 20000; // Maximum task size in MI
 uint32_t numFiles = 100;    // Number of unique files in the system
+// Add CLI parameter for cache fraction
+// Fraction of files to cache at each node (e.g., 0.2 for 20%)
+double cacheFraction = 0.2;
 // -------------------------
 
 // Global counters
@@ -287,23 +291,47 @@ void HybridCompute::ReceivePeerQuery(Ptr<Socket> socket) {
   }
 }
 
-// Prepopulate MEC and Fog caches with random files
-void PrepopulateCaches(const std::vector<Ptr<HybridCompute>>& mecApps, const std::vector<Ptr<HybridCompute>>& fogApps, uint32_t numFiles) {
-  Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
-  for (auto app : mecApps) {
-    for (uint32_t i = 0; i < numFiles/2; ++i) { // 50% files cached
-      std::string file = "file" + std::to_string(uv->GetInteger(0, numFiles-1));
-      app->InsertToCache(file);
-      g_eventLog << "[CACHE_POP] MEC " << app->GetNode()->GetId() << " " << file << std::endl;
+// Zipf distribution helper functions
+// Compute normalization constant for Zipf
+static double zipf_cdf(uint32_t n, double alpha) {
+    double c = 0.0;
+    for (uint32_t i = 1; i <= n; ++i)
+        c += 1.0 / pow(i, alpha);
+    return c;
+}
+// Sample a file index (0-based) from Zipf
+static uint32_t sample_zipf(uint32_t n, double alpha, Ptr<UniformRandomVariable> uv) {
+    double c = zipf_cdf(n, alpha);
+    double z = uv->GetValue(0.0, 1.0);
+    double sum = 0.0;
+    for (uint32_t i = 1; i <= n; ++i) {
+        sum += (1.0 / pow(i, alpha)) / c;
+        if (z <= sum)
+            return i - 1;
     }
-  }
-  for (auto app : fogApps) {
-    for (uint32_t i = 0; i < numFiles/2; ++i) {
-      std::string file = "file" + std::to_string(uv->GetInteger(0, numFiles-1));
-      app->InsertToCache(file);
-      g_eventLog << "[CACHE_POP] FOG " << app->GetNode()->GetId() << " " << file << std::endl;
+    return n - 1;
+}
+
+// Prepopulate MEC and Fog caches with Zipf-popular files, and make peer Fogs different
+void PrepopulateCachesZipf(const std::vector<Ptr<HybridCompute>>& mecApps, const std::vector<Ptr<HybridCompute>>& fogApps, uint32_t numFiles, double cacheFraction, double zipfAlpha) {
+    uint32_t filesToCache = std::max(1u, static_cast<uint32_t>(numFiles * cacheFraction));
+    // For each node, cache a different slice of the most popular files
+    for (size_t i = 0; i < mecApps.size(); ++i) {
+        for (uint32_t j = 0; j < filesToCache; ++j) {
+            uint32_t fileIdx = (j + i * filesToCache) % numFiles;
+            std::string file = "file" + std::to_string(fileIdx);
+            mecApps[i]->InsertToCache(file);
+            g_eventLog << "[CACHE_POP] MEC " << mecApps[i]->GetNode()->GetId() << " " << file << std::endl;
+        }
     }
-  }
+    for (size_t i = 0; i < fogApps.size(); ++i) {
+        for (uint32_t j = 0; j < filesToCache; ++j) {
+            uint32_t fileIdx = (j + (i+1) * filesToCache) % numFiles; // offset for peer diversity
+            std::string file = "file" + std::to_string(fileIdx);
+            fogApps[i]->InsertToCache(file);
+            g_eventLog << "[CACHE_POP] FOG " << fogApps[i]->GetNode()->GetId() << " " << file << std::endl;
+        }
+    }
 }
 
 // ---------- Topology ----------
@@ -387,8 +415,12 @@ void CreateTopology ()
       mec.Get (m)->AddApplication (mecApp);
       mecApps.push_back(mecApp);
     }
-  // Prepopulate caches
-  PrepopulateCaches(mecApps, fogApps, numFiles);
+  // Set edge capacities to allow for overflow (user can override via CLI)
+  mecCap = std::min(mecCap, 2u); // e.g., 2 concurrent tasks
+  fogCap = std::min(fogCap, 3u); // e.g., 3 concurrent tasks
+  // Prepopulate caches with Zipf-popular files
+  double zipfAlpha = 1.0; // typical value for file popularity
+  PrepopulateCachesZipf(mecApps, fogApps, numFiles, cacheFraction, zipfAlpha);
 
   /* ---------- UE clients ---------- */
   OnOffHelper client ("ns3::UdpSocketFactory", Address ());
@@ -415,14 +447,11 @@ void CreateTopology ()
       client.SetAttribute ("Remote", AddressValue (dest));
       ApplicationContainer apps = client.Install (ueNode);
       apps.Start (Seconds (1.0 + u * reqIntv));
-      // Set the payload for the OnOffApplication
-      Ptr<Application> app = apps.Get(0);
-      Ptr<OnOffApplication> onoff = DynamicCast<OnOffApplication>(app);
-      if (onoff) {
-        std::string file = "file" + std::to_string(fileUv->GetInteger(0, numFiles-1));
-        Ptr<Packet> pkt = Create<Packet>((uint8_t*)file.c_str(), file.size());
-        onoff->SetFill(pkt);
-      }
+      // Assign a file to this UE using Zipf distribution
+      uint32_t fileIdx = sample_zipf(numFiles, zipfAlpha, fileUv);
+      std::string file = "file" + std::to_string(fileIdx);
+      ueFileMap[ueNode->GetId()] = file;
+      g_eventLog << "[UE_REQ] UE" << ueNode->GetId() << " will request " << file << std::endl;
     }
 }
 
@@ -440,6 +469,7 @@ main (int argc, char *argv[])
   cmd.AddValue ("minTaskMi", "Minimum task size in MI", minTaskMi);
   cmd.AddValue ("maxTaskMi", "Maximum task size in MI", maxTaskMi);
   cmd.AddValue ("numFiles", "Number of unique files", numFiles);
+  cmd.AddValue ("cacheFraction", "Fraction of files to cache at each node (0-1)", cacheFraction);
   cmd.Parse (argc, argv);
 
   CreateTopology ();
